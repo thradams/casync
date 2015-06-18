@@ -76,15 +76,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <Text Include="ReadMe.txt" />
-  </ItemGroup>
-  <ItemGroup>
+    <ClInclude Include="actor.h" />
     <ClInclude Include="async.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="tinycthread.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="actor.cpp" />
     <ClCompile Include="async.cpp" />
     <ClCompile Include="casync.cpp" />
     <ClCompile Include="stdafx.cpp" />
