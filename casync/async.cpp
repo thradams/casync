@@ -5,94 +5,156 @@
 #include "async.h"
 #include "tinycthread.h"
 #include <assert.h>
+#include "stdlib.h"
 
 #define POOL_SIZE 2
 #define MAX_TASKS 100
 
-struct task
+struct Task
 {
-    execute_task exectask;
-    void*        arg;
+    RunAsyncCallback callback;
+    void* arg1;
 };
 
-static void task_init(struct task* task,
-    execute_task exectask,
-    void* arg)
+static void Task_Init(struct Task* task,
+    RunAsyncCallback exectask,
+    void* arg1)
 {
-    task->arg = arg;
-    task->exectask = exectask;
+    task->arg1 = arg1;    
+    task->callback = exectask;
 }
 
 
-
-struct task_queue
+struct TaskQueue
 {
-    struct task  buffer[MAX_TASKS];
-    size_t       count;
-    struct task* head;
-    struct task* tail;
+    Task   tasks[MAX_TASKS];
+    size_t count;
+    Task*  head;
+    Task*  tail;
 };
 
-static mtx_t             s_queue_mutex;
-static thrd_t            s_threads[POOL_SIZE];
-static BOOL              s_stop = FALSE;
-static cnd_t             s_condition;
-static struct task_queue s_queue;
+static mtx_t     s_queue_mutex;
+static thrd_t    s_threads[POOL_SIZE];
+static BOOL      s_stop = FALSE;
+static cnd_t     s_condition;
+static TaskQueue s_queue;
 
-static void task_queue_init(struct task_queue *q)
+
+struct TimerTask
+{
+    Task task;
+    TimerTask* pNext;    
+    timespec timePoint;
+};
+
+TimerTask * s_pTimerTaskHead = NULL;
+
+TimerTask * TimerTask_Create(struct timespec *ts,
+                              RunAsyncCallback callback,
+                              void* arg)
+{
+    TimerTask* pTimerTask = 
+        (TimerTask*)malloc(sizeof(TimerTask) * 1);
+    if (pTimerTask != NULL)
+    {
+        pTimerTask->task.callback = callback;
+        pTimerTask->task.arg1 = arg;
+        pTimerTask->pNext = NULL;
+        pTimerTask->timePoint = *ts;
+        
+    }
+    return pTimerTask;
+}
+
+void TimerTask_Delete(TimerTask *pTimerTask)
+{
+    free(pTimerTask);
+}
+
+void TimerTask_CancelAll(TimerTask *pHeadTask)
+{
+    if (pHeadTask != NULL)
+    {
+        TimerTask *current = pHeadTask;
+        while (current->pNext != NULL)
+        {
+
+            TimerTask *temp = current;
+            current = current->pNext;
+
+            temp->task.callback(RESULT_CANCELED, temp->task.arg1);
+            TimerTask_Delete(temp);
+        }
+    }
+}
+
+static void TaskQueue_Init(TaskQueue*q)
 {
     q->count = 0;
-    q->head = q->buffer;
-    q->tail = q->buffer;
+    q->head = q->tasks;
+    q->tail = q->tasks;
 }
 
-static int task_queue_push(struct task_queue * q,
-    execute_task exectask,
-    void* arg)
+static Result TaskQueue_Push(TaskQueue* q,
+    RunAsyncCallback exectask,
+    void* arg1)
 {
-    int result = 1;
+    Result result = RESULT_FAIL;
     if (q->count < MAX_TASKS)
     {
-        task_init(q->head,
-            exectask,
-            arg);
+        Task_Init(q->head, exectask, arg1);
 
         q->head++;
 
-        if (q->head == (q->buffer + MAX_TASKS))
+        if (q->head == (q->tasks + MAX_TASKS))
         {
-            q->head = q->buffer;
+            q->head = q->tasks;
         }
         q->count++;
-        result = 0;
+        result = RESULT_OK;
     }
 
-    return 1;
+    return result;
 }
 
-static struct task* task_queue_pop(struct task_queue *q)
+static struct Task* TaskQueue_Pop(TaskQueue*q)
 {
-    struct task* task = NULL;
+    Task* pTask = NULL;
     if (q->count >= 0)
     {
-        task = q->tail;
+        pTask = q->tail;
         q->tail++;
-        if (q->tail == (q->buffer + MAX_TASKS))
+        if (q->tail == (q->tasks + MAX_TASKS))
         {
-            q->tail = q->buffer;
+            q->tail = q->tasks;
         }
         q->count--;
     }
-    return task;
+    return pTask;
 }
 
-static void task_queue_clear(struct task_queue *q)
+static void TaskQueue_Clear(TaskQueue* queue)
 {
-    while (s_queue.count > 0)
+    while (queue->count > 0)
     {
-        struct task *p = task_queue_pop(q);
-        p->exectask(0, p->arg);
+        Task *pTask = TaskQueue_Pop(queue);
+        pTask->callback(RESULT_CANCELED, pTask->arg1);
     }
+}
+
+
+int Compare(struct timespec* a, struct timespec* b)
+{
+    if (a->tv_sec == b->tv_sec)
+    {
+        if (a->tv_nsec == b->tv_nsec)
+        {
+            return 0;
+        }
+        return a->tv_nsec > b->tv_nsec ? 1 : -1;
+    }
+    
+    return a->tv_sec > b->tv_sec ? 1 : -1;    
 }
 
 int main_loop(void* pData)
@@ -101,31 +163,101 @@ int main_loop(void* pData)
     {
         mtx_lock(&s_queue_mutex);
 
-        while (!s_stop &&
-            s_queue.count == 0)
+        for (;;)
         {
-            cnd_wait(&s_condition, &s_queue_mutex);
-        }
+            //Se pediu para parar não vai dormir
+            if (s_stop)
+            {
+                break;
+            }
 
-        if (s_stop &&
-            s_queue.count == 0)
+
+            //Se tiver tarefas não vai dormir
+            if (s_queue.count > 0)
+            {
+                break;
+            }
+
+            //Se tiver um timer expirado não vai dormir
+            if (s_pTimerTaskHead != NULL)
+            {
+                timespec now;
+                int r = timespec_get(&now, TIME_UTC);
+                if (Compare(&s_pTimerTaskHead->timePoint, &now) <= 0)
+                {
+                    break;
+                }                
+            }
+
+
+            if (s_pTimerTaskHead == NULL)
+            {
+                //Não tem tarefa nem timer, então dormir
+                cnd_wait(&s_condition, &s_queue_mutex);
+            }
+            else
+            {   
+                //Não tem tarefa mas tem um timer
+                cnd_timedwait(&s_condition,
+                              &s_queue_mutex, 
+                              &s_pTimerTaskHead->timePoint);  
+            }
+        }
+        
+        
+        if (!s_stop)
         {
+            TimerTask * pTimerTask = NULL;
+
+            if (s_pTimerTaskHead != NULL)
+            {
+                timespec now;
+                int r = timespec_get(&now, TIME_UTC);
+
+                //já venceu?
+                if (Compare(&s_pTimerTaskHead->timePoint, &now) <= 0)
+                {
+                    pTimerTask = s_pTimerTaskHead;
+                    s_pTimerTaskHead = s_pTimerTaskHead->pNext;
+                }
+            }
+
+            Task* pTask = NULL;
+            if (s_queue.count > 0)
+            {
+                pTask = TaskQueue_Pop(&s_queue);
+            }
+
+            //Unlock before callback
             mtx_unlock(&s_queue_mutex);
-            break;
+
+            if (pTask != NULL)
+            {
+                pTask->callback(RESULT_OK, pTask->arg1);
+            }
+
+            if (pTimerTask != NULL)
+            {
+                pTimerTask->task.callback(RESULT_OK,
+                    pTimerTask->task.arg1);
+
+                TimerTask_Delete(pTimerTask);
+            }
         }
         else
         {
-            struct task *p = task_queue_pop(&s_queue);
-            mtx_unlock(&s_queue_mutex);
-            (*p->exectask)(1, p->arg);          
+            //stopped
+            mtx_unlock(&s_queue_mutex);  
+            break;
         }
+
     }
     return 0;
 }
 
-int async_pool_init()
+Result AsyncInitialize()
 {
-    task_queue_init(&s_queue);
+    TaskQueue_Init(&s_queue);
 
     int r = mtx_init(&s_queue_mutex, mtx_plain);
     if (r == thrd_success)
@@ -143,39 +275,32 @@ int async_pool_init()
             }
         }
     }
-    return r == thrd_success ? 0 : 1;
+    return r == thrd_success ? RESULT_OK : RESULT_FAIL;
 }
 
-int async_pool_run(execute_task exectask,
-    void* arg)
+void RunAsync(RunAsyncCallback callback, void* arg1)
 {
-    int result = 0;
     mtx_lock(&s_queue_mutex);
 
-    result = task_queue_push(&s_queue, exectask, arg);
+    Result result = TaskQueue_Push(&s_queue, callback, arg1);
 
     mtx_unlock(&s_queue_mutex);
 
-    if (result == 0)
+    if (result == RESULT_OK)
     {
-        cnd_broadcast(&s_condition);
+        cnd_signal(&s_condition);
     }
-
-    return result;
+    else    
+    {
+        callback(result, arg1);
+    }    
 }
 
-void async_pool_join()
+void AsyncUninitialize()
 {
-    BOOL wasstoped = FALSE;
     mtx_lock(&s_queue_mutex);
-    wasstoped = s_stop;
     s_stop = TRUE;
     mtx_unlock(&s_queue_mutex);
-
-    if (wasstoped)
-    {
-        return;
-    }
 
     cnd_broadcast(&s_condition);
 
@@ -185,9 +310,69 @@ void async_pool_join()
         int r = thrd_join(s_threads[i], &res);
         assert(r == thrd_success);
     }
-
-    mtx_lock(&s_queue_mutex);
-    task_queue_clear(&s_queue);
-    mtx_unlock(&s_queue_mutex);
+    
+    TaskQueue_Clear(&s_queue);
+    TimerTask_CancelAll(s_pTimerTaskHead);    
 }
 
+
+void SortedInsert(struct TimerTask** ppHeadTask,
+                  struct TimerTask* pNewTask)
+{
+    struct TimerTask* current;
+    /* Special case for the head end */
+    if (*ppHeadTask == NULL || 
+        Compare(&(*ppHeadTask)->timePoint, &pNewTask->timePoint) >= 0)
+    {
+        pNewTask->pNext = *ppHeadTask;
+        *ppHeadTask = pNewTask;
+    }
+    else
+    {
+        /* Locate the node before the point of insertion */
+        current = *ppHeadTask;
+        while (current->pNext != NULL &&
+               Compare(&current->timePoint, &pNewTask->timePoint) == -1)
+        {
+            current = current->pNext;
+        }
+        pNewTask->pNext = current->pNext;
+        current->pNext = pNewTask;
+    }
+}
+
+
+void RunAsyncAt(struct timespec *ts,
+                  RunAsyncCallback callback,
+                  void* arg)
+{    
+    TimerTask* pTimerTask = TimerTask_Create(ts, callback, arg);
+       
+    Result result = pTimerTask ? RESULT_OK : RESULT_OUT_OF_MEM;
+    
+    if (result == RESULT_OK)
+    {
+        mtx_lock(&s_queue_mutex);
+       
+        SortedInsert(&s_pTimerTaskHead, pTimerTask);
+
+        mtx_unlock(&s_queue_mutex);
+        
+        cnd_signal(&s_condition);
+    }
+
+    if (result != RESULT_OK)
+    {
+        callback(result,arg);
+    }
+}
+
+void RunAsyncAfter(int nSec,
+    RunAsyncCallback callback,
+    void* arg)
+{
+    timespec now;
+    int r = timespec_get(&now, TIME_UTC);
+    now.tv_sec += nSec;
+    RunAsyncAt(&now, callback, arg);
+}

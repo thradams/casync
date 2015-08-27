@@ -5,110 +5,186 @@
 #include "async.h"
 #include <assert.h>
 
-int actor_init(struct actor* actor)
+#define ACTOR_TASKS_MAX_SIZE 100
+
+Result Actor_Init(Actor* actor)
 {
     actor->state = ACTOR_STATE_NONE;
-    actor->tasks_size = 0;
-    actor->taks_max_size = 100;
-    actor->current_tasks = 0;
-    int r = mtx_init(&actor->s_queue_mutex, mtx_plain);
-    return r;
+    actor->nTasks = 0;
+    actor->pTasks = NULL;
+    int r = mtx_init(&actor->mutex, mtx_plain);
+    return r == thrd_success ? RESULT_OK : RESULT_FAIL;
 }
 
-void actor_destroy(struct actor* actor)
+void Actor_Destroy(Actor* actor)
 {
-    mtx_destroy(&actor->s_queue_mutex);
-}
+    mtx_lock(&actor->mutex);
 
-static int actor_get_messages(actor* actor, struct actor_closure** current_tasks)
-{
-    *current_tasks = 0;
-    int tasks = 0;
-    mtx_lock(&actor->s_queue_mutex);
-    tasks = actor->tasks_size;
-
-    if (tasks != 0)
+    if (actor->pTasks != NULL)
     {
+        assert(actor->nTasks > 0);
+        for (int i = actor->nTasks - 1; i >= 0; i--)
+        {
+            actor->pTasks[i].callback(RESULT_CANCELED,
+                actor,
+                actor->pTasks[i].args);
+        }
+        free(actor->pTasks);
+    }
+
+    mtx_unlock(&actor->mutex);
+
+    mtx_destroy(&actor->mutex);    
+}
+
+static int Actor_GetMessages(Actor* actor, ActorTask** pptasks)
+{
+    *pptasks = NULL; //out
+
+    mtx_lock(&actor->mutex);
+
+    int ntasks = actor->nTasks;
+
+    if (ntasks != 0)
+    {
+        assert(actor->pTasks != NULL);
+
         actor->state = ACTOR_STATE_RUNNING;
-        *current_tasks = actor->current_tasks;
-        actor->current_tasks = 0;
-        actor->tasks_size = 0;
+        *pptasks = actor->pTasks;
+        actor->pTasks = NULL;
+        actor->nTasks = 0;
     }
     else
     {
         actor->state = ACTOR_STATE_NONE;
     }
 
-    mtx_unlock(&actor->s_queue_mutex);
-    return tasks;
+    mtx_unlock(&actor->mutex);
+    return ntasks;
 }
 
 
-static void actor_process_messages(int, void* p)
+static void Actor_ProcessMessages(Result, void* p)
 {
-    struct actor* a = (struct actor*)(p);
+    Actor* pActor = (Actor*)(p);
 
     for (;;)
     {
-        struct actor_closure* current_tasks;
-        int tasks = actor_get_messages(a, &current_tasks);
+        ActorTask* pTasks;
+        int ntasks = Actor_GetMessages(pActor, &pTasks);
 
-        if (tasks == 0)
+        if (ntasks == 0)
         {
+            assert(pTasks == NULL);
             break;
         }
 
-        for (int i = tasks - 1; i >= 0; i--)
+        for (int i = ntasks - 1; i >= 0; i--)
         {
-            current_tasks[i].callback(a, 0);
+            pTasks[i].callback(RESULT_OK,
+                pActor, 
+                pTasks[i].args);
         }
+
+        free(pTasks);
     }
 }
 
-int actor_post(actor* actor,
-    actor_callback callback,
-    void* callback_data)
+inline ActorTask* CreateActorTasks()
 {
-    int result = 0;
-    mtx_lock(&actor->s_queue_mutex);
+    return (ActorTask*)malloc(sizeof(ActorTask) * ACTOR_TASKS_MAX_SIZE);
+}
 
-    if (actor->current_tasks == 0)
+void Actor_Post(Actor* actor, ActorCallback callback, void* args)
+{
+    Result result = RESULT_OK;
+
+    mtx_lock(&actor->mutex);
+
+    if (actor->pTasks == NULL)
     {
-        actor->current_tasks =
-            (actor_closure*) malloc(sizeof(actor_closure) * actor->taks_max_size);
+        actor->pTasks = CreateActorTasks();
 
-        if (actor->current_tasks == 0)
+        if (actor->pTasks == NULL)
         {
-            //out of memor
-            result = 1;
+            result = RESULT_OUT_OF_MEM;            
         }
     }
 
-    if (result == 0)
+    if (result == RESULT_OK)
     {
-        actor->current_tasks[actor->tasks_size].callback = callback;
-        actor->current_tasks[actor->tasks_size].callback_data = callback_data;
-        actor->tasks_size++;
-
-        switch (actor->state)
+        if (actor->nTasks < ACTOR_TASKS_MAX_SIZE)
         {
-        case ACTOR_STATE_NONE:
-            actor->state = ACTOR_STATE_ONQUEUE;
-            async_pool_run(&actor_process_messages, actor);
-            break;
+            actor->pTasks[actor->nTasks].callback = callback;
+            actor->pTasks[actor->nTasks].args = args;
+            actor->nTasks++;
 
-        case ACTOR_STATE_ONQUEUE:
-        case ACTOR_STATE_RUNNING:
-            break;
+            switch (actor->state)
+            {
+            case ACTOR_STATE_NONE:
+                actor->state = ACTOR_STATE_ONQUEUE;
+                RunAsync(&Actor_ProcessMessages, actor);
+                break;
 
-        default:
-            assert(false);
+            case ACTOR_STATE_ONQUEUE:
+            case ACTOR_STATE_RUNNING:
+                break;
+
+            default:
+                assert(false);
+            }
         }
+        else
+        {
+            result = RESULT_OVERFLOW;
+        }
+    }
+
+    mtx_unlock(&actor->mutex);
+
+    if (result != RESULT_OK)
+    {
+        callback(result, actor, args);
+    }
+}
+
+struct Data
+{
+    Actor* actor;
+    ActorCallback callback;
+    void* arg;
+};
+
+
+static void Later(Result r, void* pv)
+{
+    Data * data = (Data*)pv;
+
+    if (r == RESULT_OK)
+    {        
+        Actor_Post(data->actor, data->callback, data->arg);
+    }
+    free(data);
+}
+
+
+void Actor_PostAfter(int nSec, 
+                       Actor* actor,
+                       ActorCallback callback, 
+                       void* arg)
+{
+    Data* data = (Data*)malloc(sizeof(Data) * 1);
+    if (data != NULL)
+    {
+        data->actor = actor;
+        data->callback = callback;
+        data->arg = arg;
+        RunAsyncAfter(nSec, &Later, data);
     }
     else
     {
+        callback(RESULT_OUT_OF_MEM, actor, arg);
     }
-
-    mtx_unlock(&actor->s_queue_mutex);
-    return result;
 }
+
+

@@ -1,11 +1,15 @@
 #pragma once
 
+#include "Result.h"
 
-typedef void(*execute_task)(int, void*);
+typedef void(*RunAsyncCallback)(Result, void*);
 
+Result AsyncInitialize();
+void AsyncUninitialize();
 
-int async_pool_init();
+void RunAsync(RunAsyncCallback callback,
+              void* arg);
 
-int async_pool_run(execute_task exectask,void* arg);
-
-void async_pool_join();
+void RunAsyncAfter(int nSec,
+                   RunAsyncCallback callback,
+                   void* arg);

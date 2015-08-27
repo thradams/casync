@@ -6,58 +6,90 @@
 #include "actor.h"
 #include <stdio.h>
 
-struct A
+struct B;
+
+typedef struct
 {
+    Actor actor;
     int i;
-};
-#define A_INIT { 0 }
+    B* pB;
+} A;
+
+void A_Init(A* a)
+{
+    Actor_Init(&a->actor);
+    a->i = 0;
+    a->pB = NULL;
+}
+
+void A_Destroy(A* a)
+{
+    Actor_Destroy(&a->actor);
+}
+
 
 struct B
 {
+    Actor actor;
     int i;
+    A* pA;
 };
-#define B_INIT { 0 }
 
-
-struct A a = A_INIT;
-struct actor actorA;
-
-struct B b = B_INIT;
-struct actor actorB;
-
-void pong(struct actor* actor, void* data);
-
-void ping(struct actor* actorA, void* data)
+void B_Init(B* b)
 {
-    printf("ping\n");
-
-    /*envia mensagem "pong" para actor B*/
-    actor_post(&actorB, &pong, 0);
+    Actor_Init(&b->actor);
+    b->i = 0;
+    b->pA = NULL;
 }
 
-void pong(struct actor* actorB, void* data)
+void B_Destroy(B* b)
 {
-    printf("pong\n");
+    Actor_Destroy(&b->actor);
+}
 
+void Pong(Result result, Actor* actor, void* data);
+
+void Ping(Result result, Actor* actorA, void* pv)
+{
+    if (result == RESULT_OK)
+    {
+        A* a = (A*)actorA;
+        printf("ping %d\n", (int)pv);
+        
+        /*envia mensagem "pong" para actor B*/
+        Actor_Post(&a->pB->actor, &Pong, 0);
+    }
+}
+
+void Pong(Result result, Actor* actorB, void* data)
+{
+    B* b = (B*)actorB;
+    printf("pong\n");
     /*envia mensagem "ping" para actor A*/
-    actor_post(&actorA, &ping, 0);
+    Actor_Post(&b->pA->actor, &Ping, 0);
 }
 
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-    async_pool_init();
+    AsyncInitialize();
+    
+    A a;
+    B b;
+    A_Init(&a);
+    B_Init(&b);
+    a.pB = &b;
+    b.pA = &a;
 
-    actor_init(&actorA);
-    actorA.object = &a;
+    //Actor_Post(&a.actor, &Ping, 0);
+    Actor_PostAfter(5, &a.actor, &Ping, (void*)5);
+    
+    Sleep(10000);
+    AsyncUninitialize();
+    printf("done");
 
-    actor_init(&actorB);
-    actorB.object = &b;
-
-    /*envia mensagem "ping" para actor A*/
-    actor_post(&actorA, &ping, 0);
-
-    async_pool_join();
+    A_Destroy(&a);
+    B_Destroy(&b);
 
     return 0;
 }

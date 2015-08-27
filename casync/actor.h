@@ -1,36 +1,35 @@
 #pragma once
 #include "tinycthread.h"
+#include "Result.h"
 
 enum ACTOR_STATE
 {
-    ACTOR_STATE_NONE,
-    ACTOR_STATE_RUNNING,
-    ACTOR_STATE_ONQUEUE
+  ACTOR_STATE_NONE,
+  ACTOR_STATE_RUNNING,
+  ACTOR_STATE_ONQUEUE
 };
 
-typedef void(*actor_callback)(struct actor* actor, void*);
-struct actor_closure
+typedef void(*ActorCallback)(Result result, struct Actor* actor, void*);
+struct ActorTask
 {
-    actor_callback callback;
-    void*    callback_data;
+  ActorCallback callback;
+  void*    args;
 };
 
-struct actor
+struct Actor
 {
-    ACTOR_STATE state;
-    mtx_t s_queue_mutex;
+  ACTOR_STATE state;
+  mtx_t mutex;
 
-    struct actor_closure* current_tasks;
-    int tasks_size;
-    int taks_max_size;
-
-    void* object;
+  ActorTask* pTasks;
+  int nTasks;
 };
 
 
-int  actor_init(struct actor* actor);
-void actor_destroy(struct actor* actor);
-
-int actor_post(struct actor* actor,
-    actor_callback callback,
-    void* callback_data);
+Result  Actor_Init(Actor* actor);
+void Actor_Destroy(Actor* actor);
+void Actor_Post(Actor* actor, ActorCallback callback, void* args);
+void Actor_PostAfter(int nSec,
+    Actor* actor,
+    ActorCallback callback,
+    void* args);
